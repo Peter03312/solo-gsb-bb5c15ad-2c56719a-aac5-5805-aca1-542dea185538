@@ -192,6 +192,25 @@ SCHEMA_STATEMENTS = [
         updated_at   TEXT NOT NULL
     )
     """,
+    # A delivery admission freezes one whole-window manifest decision under a
+    # unique delivery id: the timezone-aware half-open usage window (normalised
+    # to UTC) and an ordered, non-empty list of entries, each referencing either
+    # a registered version or a version slot and stating one intended use. The
+    # first result — every entry's per-segment resolved version and decision
+    # basis — is frozen verbatim in result_json. Rows are immutable history: no
+    # API ever updates or deletes them, and later catalog changes (new
+    # releases, license changes, revocations) must not rewrite a stored
+    # admission. A denied submission never inserts a row.
+    """
+    CREATE TABLE IF NOT EXISTS delivery_admissions (
+        delivery_id  TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        start_value  TEXT NOT NULL,
+        end_value    TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        result_json  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -781,3 +800,41 @@ class Database:
             (slot_name,),
         ).fetchone()
         return row is not None
+
+    def all_release_slots(self) -> list[dict[str, Any]]:
+        """Every immutable slot entry, ordered for snapshot pinning.
+
+        Admission evaluation walks each slot's release history inside one
+        pinned snapshot; the effective instant (release-wide, denormalised onto
+        the entry) orders the timeline and dense revisions break ties.
+        """
+        return self.query_all(
+            "SELECT release_id, position, slot_name, version_id, "
+            "expected_revision, assigned_revision, effective_at "
+            "FROM release_slots "
+            "ORDER BY slot_name, effective_at, assigned_revision, position, release_id"
+        )
+
+    # -- delivery admissions ----------------------------------------------
+
+    def get_delivery_admission(self, delivery_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM delivery_admissions WHERE delivery_id = ?",
+            (delivery_id,),
+        )
+
+    def insert_delivery_admission(
+        self,
+        delivery_id: str,
+        content_hash: str,
+        start_value: str,
+        end_value: str,
+        created_at: str,
+        result_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO delivery_admissions "
+            "(delivery_id, content_hash, start_value, end_value, created_at, result_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (delivery_id, content_hash, start_value, end_value, created_at, result_json),
+        )

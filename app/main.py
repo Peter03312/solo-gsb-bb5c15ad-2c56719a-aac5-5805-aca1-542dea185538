@@ -13,10 +13,15 @@ from fastapi.responses import JSONResponse
 from .config import Settings, settings as default_settings
 from .database import Database
 from .schemas import (
+    AdmissionDeniedResponse,
+    AdmissionEntryResult,
+    AdmissionRecord,
     BasisEntry,
     BlockerEntry,
     ChangeRevocationRequest,
     CreateResponse,
+    DeliveryAdmissionRequest,
+    DeliveryAdmissionResponse,
     ErrorDetail,
     ImpactedVersion,
     KeyRotationResponse,
@@ -56,7 +61,13 @@ from .schemas import (
     VoucherResponse,
 )
 from .seed import seed_demo_data
-from .service import InvalidTimeError, LicenseService, NotFoundError, ServiceError
+from .service import (
+    AdmissionDeniedError,
+    InvalidTimeError,
+    LicenseService,
+    NotFoundError,
+    ServiceError,
+)
 from .signing import KeyStore, SigningKeyUnavailableError
 
 logger = logging.getLogger("license_service")
@@ -144,6 +155,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def handle_service_error(_: Request, exc: ServiceError) -> JSONResponse:
         detail = ErrorDetail(error=exc.code, message=exc.message, details=exc.details)
         return JSONResponse(status_code=exc.status_code, content=detail.model_dump())
+
+    @app.exception_handler(AdmissionDeniedError)
+    async def handle_admission_denied(
+        _: Request, exc: AdmissionDeniedError
+    ) -> JSONResponse:
+        # Registered on the concrete subclass so it wins over the ServiceError
+        # handler: a 403 business denial additionally carries one first-failure
+        # report per failed entry. It is a read-only outcome — no admission row
+        # exists for it, so retrying the same delivery id re-evaluates.
+        body = AdmissionDeniedResponse(
+            error=exc.code,
+            message=exc.message,
+            details=exc.details,
+            failures=exc.failures,
+        )
+        return JSONResponse(status_code=exc.status_code, content=body.model_dump(mode="json"))
 
     @app.exception_handler(ValueError)
     async def handle_value_error(_: Request, exc: ValueError) -> JSONResponse:
@@ -351,6 +378,74 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             basis=[BasisEntry(**b) for b in result["basis"]],
             blockers=[BlockerEntry(**b) for b in result["blockers"]],
             allowed_uses_intersection=result["allowed_uses_intersection"],
+        )
+
+    # -- delivery admissions (whole-window immutable manifests) -----------
+
+    @app.post(
+        "/delivery-admissions",
+        response_model=DeliveryAdmissionResponse,
+        status_code=201,
+        tags=["delivery-admissions"],
+        summary="判定整份交付清单在整个使用窗口内是否持续获准，并原子固化不可变准入记录",
+        responses={
+            200: {"description": "同交付号与规范化后相同的有序输入重试，返回首次冻结的准入记录"},
+            201: {"description": "全部条目全窗口允许：各条分段判定与准入记录在同一事务固化"},
+            403: {
+                "description": (
+                    "清单未在整个窗口内获准：返回每条未通过条目的首个失败时段与阻断原因，"
+                    "槽尚未发布也算失败；不留任何准入记录"
+                )
+            },
+            404: {"description": "条目引用了未知版本，整单拒绝且不落库"},
+            409: {"description": "交付号复用到不同窗口或不同清单内容"},
+            422: {"description": "条目为空、时刻无时区、空/倒置窗口、空白用途或空白引用"},
+        },
+    )
+    def submit_delivery_admission(
+        payload: DeliveryAdmissionRequest, request: Request
+    ) -> JSONResponse | DeliveryAdmissionResponse:
+        result, replayed = service_from(request).submit_delivery_admission(
+            delivery_id=payload.delivery_id,
+            start=payload.start,
+            end=payload.end,
+            entries=[item.model_dump() for item in payload.entries],
+        )
+        body = DeliveryAdmissionResponse(
+            replayed=replayed,
+            admission=AdmissionRecord(
+                delivery_id=result["delivery_id"],
+                created_at=result["created_at"],
+                start=result["start"],
+                end=result["end"],
+                entry_count=result["entry_count"],
+                entries=[AdmissionEntryResult(**entry) for entry in result["entries"]],
+            ),
+        )
+        if replayed:
+            # 200 OK makes an idempotent retry distinguishable from the first
+            # freeze; the stored record is returned verbatim and never rebuilt.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/delivery-admissions/{delivery_id}",
+        response_model=AdmissionRecord,
+        tags=["delivery-admissions"],
+        summary="按交付号取回首次冻结的不可变准入记录（全窗口分段解析版本与判定依据）",
+        responses={404: {"description": "准入记录不存在（被拒绝的清单不会固化记录）"}},
+    )
+    def get_delivery_admission(
+        delivery_id: str, request: Request
+    ) -> AdmissionRecord:
+        result = service_from(request).get_delivery_admission(delivery_id)
+        return AdmissionRecord(
+            delivery_id=result["delivery_id"],
+            created_at=result["created_at"],
+            start=result["start"],
+            end=result["end"],
+            entry_count=result["entry_count"],
+            entries=[AdmissionEntryResult(**entry) for entry in result["entries"]],
         )
 
     # -- license changes --------------------------------------------------

@@ -219,6 +219,182 @@ class SlotPermissionResponse(BaseModel):
     allowed_uses_intersection: list[str] = Field(default_factory=list)
 
 
+# -- delivery admissions ---------------------------------------------------
+
+
+class DeliveryAdmissionEntryRequest(BaseModel):
+    """交付清单中的单条：引用已登记版本或版本槽，并声明唯一用途。"""
+
+    kind: Literal["version", "slot"] = Field(
+        description="引用类型：version=已登记版本；slot=按发布历史随窗口切换解析目标的版本槽"
+    )
+    ref: str = Field(
+        min_length=1,
+        description=(
+            "版本标识或槽名（去首尾空格后非空）；kind=version 时必须已登记，"
+            "kind=slot 时须在窗口起点前（含起点）已发布，否则该条失败"
+        ),
+    )
+    use: str = Field(min_length=1, description="该条交付的拟使用用途（去首尾空格后判定与留痕）")
+
+    @field_validator("ref", "use")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("字段不能为空白字符串")
+        return value
+
+
+class DeliveryAdmissionRequest(BaseModel):
+    """一次交付准入：唯一交付号 + 带时区半开窗口 + 非空有序条目清单。"""
+
+    delivery_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="唯一交付号；省略时自动生成 UUID（自动生成标识无法用于重试幂等）",
+    )
+    start: datetime = Field(description="使用窗口起点（含，必须带时区，服务换算为 UTC）")
+    end: datetime = Field(description="使用窗口终点（不含，必须带时区，服务换算为 UTC）")
+    entries: list[DeliveryAdmissionEntryRequest] = Field(
+        min_length=1, description="非空、按请求顺序冻结的交付条目"
+    )
+
+    _check_start = field_validator("start")(_ensure_aware)
+    _check_end = field_validator("end")(_ensure_aware)
+
+    @field_validator("delivery_id")
+    @classmethod
+    def _delivery_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("delivery_id 不能为空白字符串")
+        return value
+
+
+class AdmissionBlockerEntry(BaseModel):
+    """准入分段内的一条阻断原因（含槽未发布）。"""
+
+    version_id: str | None = Field(
+        default=None, description="阻断版本；槽尚未发布时为 null"
+    )
+    reason: Literal[
+        "no_valid_license", "use_not_allowed", "slot_not_published"
+    ]
+    change_id: str | None = None
+    effective_at: datetime | None = None
+    allowed_uses: list[str] = Field(default_factory=list)
+
+
+class AdmissionResolution(BaseModel):
+    """条目在某分段起点解析到的目标。
+
+    版本引用恒指向该版本；槽引用携带当时命中的发布标识、修订号与该发布
+    生效时刻。窗口起点前槽尚未发布时，入口级解析为“无目标”指针。
+    """
+
+    kind: Literal["version", "slot"]
+    ref: str = Field(description="提交的版本标识或槽名（去空格）")
+    version_id: str | None = Field(
+        default=None, description="解析目标版本；该分段槽未发布时为 null"
+    )
+    release_id: str | None = Field(
+        default=None, description="槽命中的发布标识；版本引用/未发布时为 null"
+    )
+    revision: int | None = Field(
+        default=None, description="槽命中发布的修订号；版本引用/未发布时为 null"
+    )
+    effective_at: datetime = Field(
+        description="解析指针的生效时刻（UTC；版本引用为窗口起点）"
+    )
+
+
+class AdmissionSegment(BaseModel):
+    """准入判定的一个连续半开分段：解析版本恒定，许可判定恒定。"""
+
+    start: datetime = Field(description="分段起点（含，UTC）")
+    end: datetime = Field(description="分段终点（不含，UTC）")
+    allowed: bool = Field(description="该分段内该用途是否始终允许")
+    resolution: AdmissionResolution = Field(description="该分段解析到的目标")
+    version_id: str | None = Field(
+        default=None, description="被判定版本；槽未发布分段为 null"
+    )
+    closure: list[str] = Field(
+        default_factory=list, description="被判定版本自身及全部祖先（槽未发布分段为空）"
+    )
+    basis: list[BasisEntry] = Field(
+        default_factory=list, description="该分段各版本所依据的最近有效变更"
+    )
+    blockers: list[AdmissionBlockerEntry] = Field(
+        default_factory=list, description="该分段全部阻断原因（允许分段为空）"
+    )
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
+class AdmissionEntryResult(BaseModel):
+    """单条交付条目的全窗口分段判定（顺序与请求一致）。"""
+
+    position: int = Field(description="该条在请求清单中的从 0 起序号")
+    kind: Literal["version", "slot"]
+    ref: str
+    use: str = Field(description="去首尾空格后的用途")
+    resolution: AdmissionResolution = Field(
+        description="窗口起点处的解析指针（槽在起点未发布时为无目标指针）"
+    )
+    segments: list[AdmissionSegment] = Field(
+        description="覆盖全窗口、连续无重叠的分段；随槽发布切换解析版本，并按许可变更细分"
+    )
+
+
+class AdmissionRecord(BaseModel):
+    """首次固化的不可变交付准入记录（不含顶层 replayed 标记）。"""
+
+    delivery_id: str
+    created_at: datetime = Field(description="准入固化时间（服务按 UTC 生成）")
+    start: datetime = Field(description="换算为 UTC 后的窗口起点（含）")
+    end: datetime = Field(description="换算为 UTC 后的窗口终点（不含）")
+    entry_count: int = Field(ge=1)
+    entries: list[AdmissionEntryResult] = Field(description="按请求顺序冻结的各条分段判定")
+
+
+class DeliveryAdmissionResponse(BaseModel):
+    replayed: bool = Field(
+        description="同交付号与规范化后相同的有序输入重试时为 true，返回首次冻结记录"
+    )
+    admission: AdmissionRecord
+
+
+class AdmissionFailure(BaseModel):
+    """整单被拒时，单条未通过条目的首个失败时段与阻断原因。"""
+
+    position: int
+    kind: Literal["version", "slot"]
+    ref: str
+    use: str
+    failure_start: datetime = Field(description="首个失败时段起点（含，UTC）")
+    failure_end: datetime = Field(description="首个失败时段终点（不含，UTC）")
+    reason: Literal[
+        "no_valid_license", "use_not_allowed", "slot_not_published"
+    ] = Field(description="首个失败时段的首要阻断原因代码")
+    blockers: list[AdmissionBlockerEntry] = Field(
+        description="首个失败时段内的全部阻断版本/槽与原因"
+    )
+
+
+class AdmissionDeniedResponse(BaseModel):
+    """HTTP 403：清单未在全窗口获准；整单不留任何准入记录。"""
+
+    error: str = Field(default="admission_denied")
+    message: str
+    details: dict[str, str | None] = Field(default_factory=dict)
+    failures: list[AdmissionFailure] = Field(
+        description="每条未通过条目的首个失败时段与阻断原因（顺序与请求一致）"
+    )
+
+
 # -- responses -------------------------------------------------------------
 
 

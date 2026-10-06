@@ -113,6 +113,29 @@ class SlotNotPublishedError(NotFoundError):
     code = "slot_not_published"
 
 
+class AdmissionDeniedError(ServiceError):
+    """A delivery manifest is not continuously allowed over its whole window.
+
+    Maps to HTTP 403. Unlike every other validation failure this is the
+    evaluated business outcome: ``failures`` lists one object per failed entry
+    (its first failing half-open interval and the blocking reasons). A denial
+    is a read-only outcome — the caller's transaction must roll back and no
+    admission row is persisted.
+    """
+
+    status_code = 403
+    code = "admission_denied"
+
+    def __init__(
+        self,
+        message: str,
+        failures: list[dict[str, Any]] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, details)
+        self.failures = failures or []
+
+
 # -- serialisation ---------------------------------------------------------
 
 
@@ -375,6 +398,177 @@ def _thaw_release_result(blob: str) -> dict[str, Any]:
             }
             for entry in data["slots"]
         ],
+    }
+
+
+def admission_content_hash(
+    start_value: str, end_value: str, entries: list[dict[str, Any]]
+) -> str:
+    """Stable hash of an admission request's window and ordered entry list.
+
+    A retry is identical only when the window converts to the same UTC
+    instants and the ordered entries match after normalisation: trimmed
+    slot/use/delivery references, the explicit ``version``/``slot`` kind and
+    the same trimmed use. Request ORDER is part of the content (the entries are
+    an ordered manifest).
+    """
+    payload = {
+        "start": start_value,
+        "end": end_value,
+        "entries": [
+            {
+                "position": entry["position"],
+                "kind": entry["kind"],
+                "ref": entry["ref"],
+                "use": entry["use"],
+            }
+            for entry in entries
+        ],
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _freeze_admission_result(result: dict[str, Any]) -> str:
+    """Freeze an admission's first result verbatim (datetimes -> canonical UTC).
+
+    The frozen snapshot is the single source returned by every identical
+    retry and by GET, so the response stays byte-for-byte stable even if a slot
+    is later published/re-pointed, a license changes or a change is revoked.
+    """
+    payload = {
+        "delivery_id": result["delivery_id"],
+        "created_at": to_canonical(result["created_at"]),
+        "start": to_canonical(result["start"]),
+        "end": to_canonical(result["end"]),
+        "entry_count": result["entry_count"],
+        "entries": [
+            {
+                "position": entry["position"],
+                "kind": entry["kind"],
+                "ref": entry["ref"],
+                "use": entry["use"],
+                "resolution": _freeze_admission_resolution(entry["resolution"]),
+                "segments": [
+                    _freeze_admission_segment(segment)
+                    for segment in entry["segments"]
+                ],
+            }
+            for entry in result["entries"]
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _freeze_admission_resolution(resolution: dict[str, Any] | None) -> dict[str, Any] | None:
+    if resolution is None:
+        return None
+    return {
+        "kind": resolution["kind"],
+        "ref": resolution["ref"],
+        "version_id": resolution["version_id"],
+        "release_id": resolution.get("release_id"),
+        "revision": resolution.get("revision"),
+        "effective_at": to_canonical(resolution["effective_at"]),
+    }
+
+
+def _freeze_admission_segment(segment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start": to_canonical(segment["start"]),
+        "end": to_canonical(segment["end"]),
+        "allowed": bool(segment["allowed"]),
+        "resolution": _freeze_admission_resolution(segment["resolution"]),
+        "version_id": segment["version_id"],
+        "closure": list(segment["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": to_canonical(entry["effective_at"]),
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in segment["basis"]
+        ],
+        "blockers": _blockers_jsonable(segment["blockers"]),
+        "allowed_uses_intersection": list(segment["allowed_uses_intersection"]),
+    }
+
+
+def _thaw_admission_result(blob: str) -> dict[str, Any]:
+    """Inverse of :func:`_freeze_admission_result` for replay/GET responses."""
+    data = json.loads(blob)
+    return {
+        "delivery_id": data["delivery_id"],
+        "created_at": parse_canonical(data["created_at"]),
+        "start": parse_canonical(data["start"]),
+        "end": parse_canonical(data["end"]),
+        "entry_count": int(data["entry_count"]),
+        "entries": [
+            {
+                "position": int(entry["position"]),
+                "kind": entry["kind"],
+                "ref": entry["ref"],
+                "use": entry["use"],
+                "resolution": _thaw_admission_resolution(entry["resolution"]),
+                "segments": [
+                    _thaw_admission_segment(segment) for segment in entry["segments"]
+                ],
+            }
+            for entry in data["entries"]
+        ],
+    }
+
+
+def _thaw_admission_resolution(resolution: dict[str, Any] | None) -> dict[str, Any] | None:
+    if resolution is None:
+        return None
+    return {
+        "kind": resolution["kind"],
+        "ref": resolution["ref"],
+        "version_id": resolution["version_id"],
+        "release_id": resolution.get("release_id"),
+        "revision": resolution.get("revision"),
+        "effective_at": parse_canonical(resolution["effective_at"]),
+    }
+
+
+def _thaw_admission_segment(segment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start": parse_canonical(segment["start"]),
+        "end": parse_canonical(segment["end"]),
+        "allowed": bool(segment["allowed"]),
+        "resolution": _thaw_admission_resolution(segment["resolution"]),
+        "version_id": segment["version_id"],
+        "closure": list(segment["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": parse_canonical(entry["effective_at"]),
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in segment["basis"]
+        ],
+        "blockers": _blockers_from_jsonable(segment["blockers"]),
+        "allowed_uses_intersection": list(segment["allowed_uses_intersection"]),
+    }
+
+
+def _admission_failure_from_segment(
+    entry: dict[str, Any], segment: dict[str, Any]
+) -> dict[str, Any]:
+    """Build one failed entry report from its first failing segment."""
+    blockers = segment["blockers"]
+    return {
+        "position": entry["position"],
+        "kind": entry["kind"],
+        "ref": entry["ref"],
+        "use": entry["use"],
+        "failure_start": segment["start"],
+        "failure_end": segment["end"],
+        "reason": blockers[0]["reason"] if blockers else "not_allowed",
+        "blockers": blockers,
     }
 
 
@@ -1108,35 +1302,7 @@ class LicenseService:
         start_c = to_canonical(start_utc)
         end_c = to_canonical(end_utc)
         closure = snapshot.closure_from(version_id)
-
-        interior: set[str] = set()
-        for vid in closure:
-            for change in snapshot.changes.get(vid, ()):
-                if change.change_id in snapshot.revoked_change_ids:
-                    # Revoked changes neither split segments nor set policy.
-                    continue
-                if start_c < change.effective_at < end_c:
-                    interior.add(change.effective_at)
-        edges = [start_c, *sorted(interior), end_c]
-
-        segments: list[dict[str, Any]] = []
-        open_segment: tuple[tuple[Any, ...], dict[str, Any], str] | None = None
-        for index in range(len(edges) - 1):
-            seg_start = edges[index]
-            # The state is constant within [seg_start, next edge): only a
-            # change can alter it, and every in-interval change is an edge.
-            state = _evaluate(snapshot, version_id, use, seg_start, None)
-            key = _segment_state_key(state)
-            if open_segment is not None and open_segment[0] == key:
-                # Identical basis and blockers: extend the previous segment.
-                continue
-            if open_segment is not None:
-                segments.append(
-                    _segment_payload(open_segment[2], seg_start, open_segment[1])
-                )
-            open_segment = (key, state, seg_start)
-        assert open_segment is not None  # start < end guarantees >= 1 segment
-        segments.append(_segment_payload(open_segment[2], end_c, open_segment[1]))
+        segments = _permission_segments(snapshot, version_id, use, start_c, end_c)
 
         return {
             "version_id": version_id,
@@ -1894,6 +2060,300 @@ class LicenseService:
         decision = self.check_permission(resolution["version_id"], use, at)
         return {"resolution": resolution, **decision}
 
+    # -- delivery admissions (whole-window immutable manifests) -----------
+
+    def submit_delivery_admission(
+        self,
+        delivery_id: str | None,
+        start: datetime,
+        end: datetime,
+        entries: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically admit a whole delivery manifest over its usage window.
+
+        Each entry references either a registered ``version`` or a version
+        ``slot`` and states one trimmed intended use. Slot references follow
+        the slot's published re-points within the half-open window
+        ``[start, end)`` — the target version is resolved per segment against
+        the SAME database snapshot — and the resolved version is then judged
+        with the existing ancestor/intersection/license/revocation rules for
+        that segment. Releases or license changes effective exactly at
+        ``start`` apply; anything exactly at ``end`` does not.
+
+        Only when EVERY entry is allowed for the ENTIRE window is the
+        admission record frozen in one write transaction with every entry's
+        per-segment resolved version and decision basis; otherwise an
+        :class:`AdmissionDeniedError` lists each failed entry's FIRST failing
+        interval and its blocking reasons (a slot not published yet fails too)
+        and NOTHING is persisted.
+
+        A retry with the same delivery id and an identical normalised input
+        (trimmed refs/uses, UTC instants, same order) returns the frozen first
+        result; the same id with different content is a conflict. Unknown
+        versions, naive times, an empty window or blank uses are rejected
+        before any row is written.
+        """
+        if not isinstance(start, datetime) or start.tzinfo is None:
+            raise InvalidTimeError("使用窗口起点必须带时区信息")
+        if not isinstance(end, datetime) or end.tzinfo is None:
+            raise InvalidTimeError("使用窗口终点必须带时区信息")
+        if not entries:
+            # The HTTP schema enforces this too; keep the service contract.
+            raise ServiceError("交付条目清单不能为空")
+
+        delivery_id = (delivery_id or "").strip() or f"del-{uuid.uuid4().hex}"
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+        if not start_utc < end_utc:
+            raise InvalidIntervalError(
+                "使用窗口起点必须严格早于终点（半开区间 [start, end) 不能为空或倒置）",
+                {"start": to_canonical(start_utc), "end": to_canonical(end_utc)},
+            )
+        start_c = to_canonical(start_utc)
+        end_c = to_canonical(end_utc)
+
+        normalised: list[dict[str, Any]] = []
+        for pos, item in enumerate(entries):
+            kind = str(item["kind"]).strip()
+            if kind not in ("version", "slot"):
+                raise ServiceError(
+                    f"第 {pos} 条条目的引用类型必须是 version 或 slot",
+                    {"index": str(pos)},
+                )
+            ref = str(item["ref"]).strip()
+            if not ref:
+                raise ServiceError(
+                    f"第 {pos} 条条目的引用标识不能为空", {"index": str(pos)}
+                )
+            use = str(item["use"]).strip()
+            if not use:
+                raise ServiceError(
+                    f"第 {pos} 条条目的用途不能为空", {"index": str(pos)}
+                )
+            normalised.append(
+                {"position": pos, "kind": kind, "ref": ref, "use": use}
+            )
+
+        digest = admission_content_hash(start_c, end_c, normalised)
+
+        with self.db.lock:
+            existing = self.db.get_delivery_admission(delivery_id)
+            if existing is not None:
+                if existing["content_hash"] != digest:
+                    raise ConflictError(
+                        "同一交付标识已存在但窗口或条目内容不同（交付标识不可复用指向不同清单）",
+                        {"delivery_id": delivery_id},
+                    )
+                return _thaw_admission_result(existing["result_json"]), True
+
+            # Unknown versions are a request error (whole order rejected);
+            # unpublished slots are instead an evaluated failure per entry.
+            missing = sorted(
+                {
+                    entry["ref"]
+                    for entry in normalised
+                    if entry["kind"] == "version"
+                    and self.db.get_version(entry["ref"]) is None
+                }
+            )
+            if missing:
+                raise NotFoundError(
+                    "交付条目中引用了尚未登记的版本，整单拒绝",
+                    {"delivery_id": delivery_id,
+                     "missing_version_ids": ",".join(missing)},
+                )
+
+            try:
+                # One BEGIN IMMEDIATE pins a single snapshot for every slot
+                # resolution and permission evaluation, so a re-point and its
+                # judgement can never come from different catalog states.
+                self.db.begin()
+                raced = self.db.get_delivery_admission(delivery_id)
+                if raced is not None:
+                    if raced["content_hash"] != digest:
+                        raise ConflictError(
+                            "同一交付标识已存在但窗口或条目内容不同（交付标识不可复用指向不同清单）",
+                            {"delivery_id": delivery_id},
+                        )
+                    self.db.rollback()
+                    return _thaw_admission_result(raced["result_json"]), True
+
+                snapshot = self._capture_snapshot(manage_transaction=False)
+                results: list[dict[str, Any]] = []
+                failures: list[dict[str, Any]] = []
+                for entry in normalised:
+                    evaluated = self._evaluate_admission_entry(
+                        snapshot, entry, start_c, end_c
+                    )
+                    results.append(evaluated)
+                    for segment in evaluated["segments"]:
+                        if not segment["allowed"]:
+                            failures.append(
+                                _admission_failure_from_segment(entry, segment)
+                            )
+                            break
+
+                if failures:
+                    # Denial is an evaluated outcome, not a write: roll the
+                    # read transaction back and leave no admission row.
+                    self.db.rollback()
+                    raise AdmissionDeniedError(
+                        "交付清单未在整个使用窗口内持续获准，未固化任何准入记录",
+                        failures=failures,
+                        details={"delivery_id": delivery_id},
+                    )
+
+                created = to_canonical(now_utc())
+                result = {
+                    "delivery_id": delivery_id,
+                    "created_at": parse_canonical(created),
+                    "start": start_utc,
+                    "end": end_utc,
+                    "entry_count": len(results),
+                    "entries": results,
+                }
+                self.db.insert_delivery_admission(
+                    delivery_id=delivery_id,
+                    content_hash=digest,
+                    start_value=start_c,
+                    end_value=end_c,
+                    created_at=created,
+                    result_json=_freeze_admission_result(result),
+                )
+                self.db.commit()
+            except AdmissionDeniedError:
+                raise
+            except Exception:
+                self.db.rollback()
+                # A concurrent first-writer may have won the delivery id.
+                raced = self.db.get_delivery_admission(delivery_id)
+                if raced is not None:
+                    if raced["content_hash"] == digest:
+                        return _thaw_admission_result(raced["result_json"]), True
+                    raise ConflictError(
+                        "同一交付标识已存在但窗口或条目内容不同（交付标识不可复用指向不同清单）",
+                        {"delivery_id": delivery_id},
+                    ) from None
+                raise
+
+            stored = self.db.get_delivery_admission(delivery_id)
+            assert stored is not None
+            return _thaw_admission_result(stored["result_json"]), False
+
+    def get_delivery_admission(self, delivery_id: str) -> dict[str, Any]:
+        """Return the immutable frozen admission record for a delivery id."""
+        row = self.db.get_delivery_admission(delivery_id)
+        if row is None:
+            raise NotFoundError(
+                "交付准入记录不存在（被拒绝的清单不会固化记录）",
+                {"delivery_id": delivery_id},
+            )
+        return _thaw_admission_result(row["result_json"])
+
+    def _evaluate_admission_entry(
+        self,
+        snapshot: Snapshot,
+        entry: dict[str, Any],
+        start_c: str,
+        end_c: str,
+    ) -> dict[str, Any]:
+        """Resolve one entry over the window and slice its permission timeline.
+
+        A version entry resolves to that version for the whole window (its
+        ``resolution`` is a version pointer). A slot entry follows the slot's
+        published history: the window is partitioned by re-points, and each
+        resolution interval carries the effective release pointer. A prefix
+        without an effective release is one synthetic segment blocked with
+        ``slot_not_published``.
+        """
+        kind = entry["kind"]
+        ref = entry["ref"]
+        use = entry["use"]
+
+        if kind == "version":
+            resolution = {
+                "kind": "version",
+                "ref": ref,
+                "version_id": ref,
+                "release_id": None,
+                "revision": None,
+                "effective_at": parse_canonical(start_c),
+            }
+            permission_segments = _permission_segments(
+                snapshot, ref, use, start_c, end_c
+            )
+            segments = [
+                {**segment, "resolution": resolution, "version_id": ref}
+                for segment in permission_segments
+            ]
+            return {**entry, "resolution": resolution, "segments": segments}
+
+        intervals = snapshot.slot_resolution_intervals(ref, start_c, end_c)
+        segments: list[dict[str, Any]] = []
+        first_resolution: dict[str, Any] | None = None
+        for seg_start, seg_end, target in intervals:
+            if target is None:
+                # No release effective at or before this segment: the slot is
+                # not published for this part of the window — an explicit
+                # failure, never a guessed version.
+                resolution = {
+                    "kind": "slot",
+                    "ref": ref,
+                    "version_id": None,
+                    "release_id": None,
+                    "revision": None,
+                    "effective_at": parse_canonical(seg_start),
+                }
+                segment = {
+                    "start": parse_canonical(seg_start),
+                    "end": parse_canonical(seg_end),
+                    "allowed": False,
+                    "resolution": resolution,
+                    "version_id": None,
+                    "closure": [],
+                    "basis": [],
+                    "blockers": [
+                        {
+                            "version_id": None,
+                            "reason": "slot_not_published",
+                        }
+                    ],
+                    "allowed_uses_intersection": [],
+                }
+            else:
+                resolution = {
+                    "kind": "slot",
+                    "ref": ref,
+                    "version_id": target.version_id,
+                    "release_id": target.release_id,
+                    "revision": target.revision,
+                    "effective_at": parse_canonical(target.effective_at),
+                }
+                permission_segments = _permission_segments(
+                    snapshot, target.version_id, use, seg_start, seg_end
+                )
+                # _permission_segments may return several pieces when a license
+                # change lands inside this resolution interval; attach the same
+                # resolution to every piece.
+                pieces = [
+                    {**piece, "resolution": resolution, "version_id": target.version_id}
+                    for piece in permission_segments
+                ]
+                if first_resolution is None:
+                    first_resolution = resolution
+                segments.extend(pieces)
+                continue
+            if first_resolution is None:
+                first_resolution = resolution
+            segments.append(segment)
+
+        # Resolution reported at the entry level is the pointer governing the
+        # first instant of the window (a slot may have been published exactly
+        # at start; otherwise this is an unpublished-pointer entry).
+        entry_resolution = first_resolution
+        assert entry_resolution is not None
+        return {**entry, "resolution": entry_resolution, "segments": segments}
+
     def _propagate_subscription_flips(
         self,
         *,
@@ -2172,11 +2632,23 @@ class LicenseService:
                         allowed_uses=list(row["allowed_uses"]),
                     )
                 )
+            slot_releases: dict[str, list[SlotRelease]] = {}
+            for row in self.db.all_release_slots():
+                slot_releases.setdefault(row["slot_name"], []).append(
+                    SlotRelease(
+                        slot_name=row["slot_name"],
+                        version_id=row["version_id"],
+                        release_id=row["release_id"],
+                        revision=int(row["assigned_revision"]),
+                        effective_at=row["effective_at"],
+                    )
+                )
             return Snapshot(
                 versions=versions,
                 edges=edges,
                 changes=changes,
                 revoked_change_ids=revoked,
+                slot_releases=slot_releases,
             )
         finally:
             if manage_transaction:
@@ -2193,6 +2665,14 @@ class EffectiveChange(NamedTuple):
     allowed_uses: list[str]
 
 
+class SlotRelease(NamedTuple):
+    slot_name: str
+    version_id: str
+    release_id: str
+    revision: int
+    effective_at: str  # canonical UTC (release-wide)
+
+
 @dataclass(frozen=True)
 class Snapshot:
     versions: set[str]
@@ -2201,6 +2681,10 @@ class Snapshot:
     revoked_change_ids: set[str] = frozenset()  # type: ignore[assignment]
     parents_map: dict[str, list[str]] = field(default_factory=dict)
     children_map: dict[str, list[str]] = field(default_factory=dict)
+    # Per-slot immutable publish history, ordered by effective instant then
+    # dense revision; admission evaluation re-points a slot reference across the
+    # whole usage window using exactly this history.
+    slot_releases: dict[str, list[SlotRelease]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         parents: dict[str, list[str]] = {vid: [] for vid in self.versions}
@@ -2273,6 +2757,45 @@ class Snapshot:
         if stored is not None and stored.effective_at > override.effective_at:
             return stored
         return override
+
+    def slot_resolution_intervals(
+        self,
+        slot_name: str,
+        start_c: str,
+        end_c: str,
+    ) -> list[tuple[str, str, SlotRelease | None]]:
+        """Partition ``[start_c, end_c)`` by the slot's published re-points.
+
+        Returns consecutive half-open intervals ``(seg_start, seg_end, target)``
+        covering the whole window. ``target`` is the most recent release of the
+        slot effective at or before the segment start (a release exactly at
+        ``start_c`` already applies; a release exactly at ``end_c`` is excluded);
+        it is ``None`` for the prefix (or whole window) before the slot's first
+        effective release — admissions treat an unpublished slot as a failure
+        rather than guessing a version.
+        """
+        history = self.slot_releases.get(slot_name, ())
+        # Strictly interior re-points split segments; a release at start opens
+        # the first segment and one at end never applies.
+        edges = [start_c]
+        edges.extend(
+            release.effective_at
+            for release in history
+            if start_c < release.effective_at < end_c
+        )
+        edges.append(end_c)
+
+        # Prefix of releases up to each boundary; history is time/revision
+        # sorted, so the last effective entry is the current target.
+        index = 0
+        current: SlotRelease | None = None
+        intervals: list[tuple[str, str, SlotRelease | None]] = []
+        for edge_index, seg_start in enumerate(edges[:-1]):
+            while index < len(history) and history[index].effective_at <= seg_start:
+                current = history[index]
+                index += 1
+            intervals.append((seg_start, edges[edge_index + 1], current))
+        return intervals
 
 
 def _evaluate(
@@ -2370,7 +2893,55 @@ def _segment_payload(start_c: str, end_c: str, state: dict[str, Any]) -> dict[st
         "start": parse_canonical(start_c),
         "end": parse_canonical(end_c),
         "allowed": state["allowed"],
+        "closure": state["closure"],
         "basis": state["basis"],
         "blockers": state["blockers"],
         "allowed_uses_intersection": state["allowed_uses_intersection"],
     }
+
+
+def _permission_segments(
+    snapshot: Snapshot,
+    version_id: str,
+    use: str,
+    start_c: str,
+    end_c: str,
+) -> list[dict[str, Any]]:
+    """Slice ``[start_c, end_c)`` for one fixed resolved version, merged.
+
+    Segment boundaries are the effective instants (canonical UTC) of the
+    closure's non-revoked changes strictly inside the interval; a change
+    exactly at ``start_c`` applies from the first segment on, one exactly at
+    ``end_c`` is not counted, and revoked changes are ignored. Adjacent slices
+    with identical basis/blockers/intersection merge into one segment.
+    """
+    closure = snapshot.closure_from(version_id)
+    interior: set[str] = set()
+    for vid in closure:
+        for change in snapshot.changes.get(vid, ()):
+            if change.change_id in snapshot.revoked_change_ids:
+                # Revoked changes neither split segments nor set policy.
+                continue
+            if start_c < change.effective_at < end_c:
+                interior.add(change.effective_at)
+    edges = [start_c, *sorted(interior), end_c]
+
+    segments: list[dict[str, Any]] = []
+    open_segment: tuple[tuple[Any, ...], dict[str, Any], str] | None = None
+    for index in range(len(edges) - 1):
+        seg_start = edges[index]
+        # The state is constant within [seg_start, next edge): only a
+        # change can alter it, and every in-interval change is an edge.
+        state = _evaluate(snapshot, version_id, use, seg_start, None)
+        key = _segment_state_key(state)
+        if open_segment is not None and open_segment[0] == key:
+            # Identical basis and blockers: extend the previous segment.
+            continue
+        if open_segment is not None:
+            segments.append(
+                _segment_payload(open_segment[2], seg_start, open_segment[1])
+            )
+        open_segment = (key, state, seg_start)
+    assert open_segment is not None  # start < end guarantees >= 1 segment
+    segments.append(_segment_payload(open_segment[2], end_c, open_segment[1]))
+    return segments

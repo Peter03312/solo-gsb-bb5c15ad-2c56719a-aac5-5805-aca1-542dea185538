@@ -352,6 +352,69 @@ say "历史复现判定：解析槽当时版本后按现有规则判定用途（
 curl -s "$BASE/slot-permissions/prod?use=research&at=2026-08-15T00:00:00Z"; echo
 curl -s "$BASE/slot-permissions/prod?use=research&at=2026-09-15T00:00:00Z"; echo
 
+say "交付准入：版本条目全窗口持续允许 research -> 201，原子固化不可变记录（含各段解析版本与判定依据）"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{
+    "delivery_id": "example-delivery-1",
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-12-01T00:00:00Z",
+    "entries": [
+      {"kind": "version", "ref": "release-demo-v1", "use": "research"},
+      {"kind": "slot", "ref": " prod ", "use": " research "}
+    ]
+  }'; echo
+
+say "交付准入重试：引用/用途去空格、+08:00 同一 UTC 瞬间、顺序一致 -> 200 replayed=true，返回首次记录"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{
+    "delivery_id": " example-delivery-1 ",
+    "start": "2026-08-01T08:00:00+08:00",
+    "end": "2026-12-01T08:00:00+08:00",
+    "entries": [
+      {"kind": "version", "ref": "release-demo-v1", "use": "research"},
+      {"kind": "slot", "ref": "prod", "use": "research"}
+    ]
+  }'; echo
+
+say "交付准入追溯：按交付号取回首次固化记录（之后目录变化不改写它）"
+curl -s "$BASE/delivery-admissions/example-delivery-1"; echo
+
+say "交付准入冲突：同一交付号换窗口/换条目（含换序）-> 409，首次记录不变"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-1","start":"2026-08-01T00:00:00Z","end":"2027-01-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"release-demo-v1","use":"research"}]}'; echo
+
+say "交付准入拒绝：窗口早于 prod 首次发布 -> 403，首个失败时段 [07-01,08-01) 原因 slot_not_published，且不留记录"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-early","start":"2026-07-01T00:00:00Z","end":"2026-08-15T00:00:00Z",
+       "entries":[{"kind":"slot","ref":"prod","use":"research"}]}'; echo
+echo "# 被拒绝的交付号 GET 为 404："
+curl -s "$BASE/delivery-admissions/example-delivery-early"; echo
+
+say "交付准入拒绝：槽从未发布（整段失败）/ 用途中途被收回（首个失败时段与 use_not_allowed 依据）"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-neverslot","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"slot","ref":"no-such-slot","use":"research"}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-review","start":"2026-07-01T00:00:00Z","end":"2026-10-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"demo-root-a","use":"review"}]}'; echo
+
+say "交付准入错误：未知版本 404 / 无时区 / 空窗口 / 空白用途 / 空清单 均为 4xx 且整单不落库"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-404","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"no-such-version","use":"research"}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-bad1","start":"2026-08-01T00:00:00","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"demo-root-a","use":"research"}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-bad2","start":"2026-12-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"demo-root-a","use":"research"}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-bad3","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"demo-root-a","use":"   "}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-bad4","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z","entries":[]}'; echo
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 
