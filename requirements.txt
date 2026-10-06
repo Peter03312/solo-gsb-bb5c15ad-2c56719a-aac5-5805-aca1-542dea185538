@@ -1,0 +1,5 @@
+fastapi==0.142.2
+uvicorn[standard]>=0.30
+pydantic>=2.9
+# Ed25519 proof-package signing/verification (JWS EdDSA, RFC 8037/8032)
+cryptography>=42.0.0

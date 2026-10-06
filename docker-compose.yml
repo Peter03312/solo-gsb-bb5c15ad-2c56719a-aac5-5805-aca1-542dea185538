@@ -1,0 +1,29 @@
+services:
+  license-service:
+    build: .
+    image: dataset-license-service:1.0.0
+    container_name: dataset-license-service
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      # 容器内监听 0.0.0.0:8000；宿主机访问 http://localhost:8000
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      DB_PATH: "/data/licenses.db"
+      # 证明包签名密钥目录（与数据库同在持久卷内；轮换后旧密钥保留可验签）
+      SIGNING_KEYS_DIR: "/data/signing-keys"
+      INIT_DB: "${INIT_DB:-true}"
+      SEED_DEMO: "${SEED_DEMO:-true}"
+      INIT_SIGNING_KEY: "${INIT_SIGNING_KEY:-true}"
+    volumes:
+      - license-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  license-data:
