@@ -352,6 +352,81 @@ say "历史复现判定：解析槽当时版本后按现有规则判定用途（
 curl -s "$BASE/slot-permissions/prod?use=research&at=2026-08-15T00:00:00Z"; echo
 curl -s "$BASE/slot-permissions/prod?use=research&at=2026-09-15T00:00:00Z"; echo
 
+say "交付准入：为 release-demo 系列版本登记许可（root/v1 允许 research+review，v2 仅 research）"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"delivery-demo-c0","version_id":"release-demo-root","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research","review"]}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"delivery-demo-c1","version_id":"release-demo-v1","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research","review"]}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"delivery-demo-c2","version_id":"release-demo-v2","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null || true
+
+say "交付准入 1：窗口 [2026-08-01, 2026-10-01) 跨 9/1 发布切换，prod 槽 research 持续获准 -> 201 原子固化准入记录"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{
+    "delivery_id": "example-delivery-1",
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-10-01T00:00:00Z",
+    "entries": [
+      {"slot": "prod", "use": "research"},
+      {"version_id": "demo-root-a", "use": " research "}
+    ]
+  }'; echo
+
+say "交付准入重试：同交付号 + 去空格用途 + +08:00 同一 UTC 窗口 + 同序条目 -> 200 replayed=true，返回首次冻结记录"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{
+    "delivery_id": "example-delivery-1",
+    "start": "2026-08-01T08:00:00+08:00",
+    "end": "2026-10-01T08:00:00+08:00",
+    "entries": [
+      {"slot": " prod ", "use": " research "},
+      {"version_id": "demo-root-a", "use": "research"}
+    ]
+  }'; echo
+
+say "交付准入追溯：按交付号取回首次固化的准入记录（后续目录变化不改写）"
+curl -s "$BASE/deliveries/admissions/example-delivery-1"; echo
+
+say "交付准入冲突：同一交付号换输入（窗口不同/条目不同/条目换序）-> 409"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-1","start":"2026-08-01T00:00:00Z","end":"2026-11-01T00:00:00Z","entries":[{"slot":"prod","use":"research"}]}'; echo
+
+say "交付准入 2：prod 槽 review 在 9/1 发布切换到 v2 后被拒 -> 200 admitted=false，给出首个失败时段与阻断原因，不留记录"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{
+    "delivery_id": "example-delivery-2",
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-10-01T00:00:00Z",
+    "entries": [{"slot": "prod", "use": "review"}]
+  }'; echo
+
+say "未准入不留记录：按交付号查询 -> 404"
+curl -s "$BASE/deliveries/admissions/example-delivery-2"; echo
+
+say "交付准入 3：槽在窗口内尚未发布也算失败（slot_not_published）"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-3","start":"2026-07-01T00:00:00Z","end":"2026-08-15T00:00:00Z","entries":[{"slot":"prod","use":"research"}]}'; echo
+
+say "交付准入错误 1：条目引用未知版本 -> 404，整单不落库"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-x","start":"2026-08-01T00:00:00Z","end":"2026-10-01T00:00:00Z","entries":[{"version_id":"no-such-version","use":"research"}]}'; echo
+
+say "交付准入错误 2：起止时刻无时区 -> 422"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-x","start":"2026-08-01T00:00:00","end":"2026-10-01T00:00:00Z","entries":[{"slot":"prod","use":"research"}]}'; echo
+
+say "交付准入错误 3：空窗口（start 不早于 end）-> 422 invalid_interval"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-x","start":"2026-10-01T00:00:00Z","end":"2026-08-01T00:00:00Z","entries":[{"slot":"prod","use":"research"}]}'; echo
+
+say "交付准入错误 4：空白用途 / 空条目清单 / 条目同时给版本与槽 -> 422"
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-x","start":"2026-08-01T00:00:00Z","end":"2026-10-01T00:00:00Z","entries":[{"slot":"prod","use":"  "}]}'; echo
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-x","start":"2026-08-01T00:00:00Z","end":"2026-10-01T00:00:00Z","entries":[]}'; echo
+curl -s -X POST "$BASE/deliveries/admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-x","start":"2026-08-01T00:00:00Z","end":"2026-10-01T00:00:00Z","entries":[{"version_id":"demo-root-a","slot":"prod","use":"research"}]}'; echo
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 

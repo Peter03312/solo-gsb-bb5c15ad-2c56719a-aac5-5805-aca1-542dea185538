@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -608,6 +608,172 @@ class ErrorDetail(BaseModel):
     error: str
     message: str
     details: dict[str, str | None] = Field(default_factory=dict)
+
+
+# -- delivery admissions (whole-window manifest clearance) -------------------
+
+
+class DeliveryEntryItem(BaseModel):
+    """交付清单中的单条：明确引用一个已登记版本或一个版本槽，并给出用途。"""
+
+    version_id: str | None = Field(
+        default=None, min_length=1, description="已登记的数据集版本（与 slot 二选一）"
+    )
+    slot: str | None = Field(
+        default=None,
+        min_length=1,
+        description="版本槽名（与 version_id 二选一；去首尾空格后非空）",
+    )
+    use: str = Field(min_length=1, description="拟使用的用途（去首尾空格后判定与留痕）")
+
+    @field_validator("slot")
+    @classmethod
+    def _slot(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("slot 不能为空白字符串")
+        return value
+
+    @field_validator("use")
+    @classmethod
+    def _use(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("use 不能为空白字符串")
+        return value
+
+    @model_validator(mode="after")
+    def _exactly_one_reference(self) -> "DeliveryEntryItem":
+        if (self.version_id is None) == (self.slot is None):
+            raise ValueError("每条交付条目必须且只能引用 version_id 或 slot 之一")
+        return self
+
+
+class DeliveryAdmissionRequest(BaseModel):
+    """一次交付准入判定：唯一交付号 + 带时区半开窗口 + 非空有序条目清单。"""
+
+    delivery_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="唯一交付号；省略时自动生成 UUID（自动生成标识无法用于重试幂等）",
+    )
+    start: datetime = Field(description="使用窗口开始时刻（带时区，含），服务统一换算为 UTC")
+    end: datetime = Field(description="使用窗口结束时刻（带时区，不含），服务统一换算为 UTC")
+    entries: list[DeliveryEntryItem] = Field(
+        min_length=1, description="非空、按请求顺序判定与冻结的交付条目清单"
+    )
+
+    _check_start = field_validator("start")(_ensure_aware)
+    _check_end = field_validator("end")(_ensure_aware)
+
+
+class AdmissionBlockerEntry(BaseModel):
+    """准入判定中的一条阻断原因；槽未发布时携带槽名而非版本。"""
+
+    version_id: str | None = Field(
+        default=None, description="阻断版本；槽未发布（slot_not_published）时为 null"
+    )
+    reason: Literal["no_valid_license", "use_not_allowed", "slot_not_published"]
+    change_id: str | None = None
+    effective_at: datetime | None = None
+    allowed_uses: list[str] = Field(default_factory=list)
+    slot: str | None = Field(
+        default=None, description="阻断原因为 slot_not_published 时标识对应版本槽"
+    )
+
+
+class DeliveryAdmissionSegment(BaseModel):
+    """准入记录中某条目的一段连续判定片段（含该段解析出的目标版本）。"""
+
+    start: datetime = Field(description="片段起点（含）")
+    end: datetime = Field(description="片段终点（不含）")
+    version_id: str | None = Field(
+        description="该片段解析出的目标版本；槽在该片段尚未发布时为 null"
+    )
+    release_id: str | None = Field(
+        default=None, description="槽条目：该片段命中的发布标识；版本条目/未发布为 null"
+    )
+    revision: int | None = Field(
+        default=None, description="槽条目：该片段命中的发布修订号；版本条目/未发布为 null"
+    )
+    allowed: bool
+    basis: list[BasisEntry] = Field(default_factory=list, description="片段内各版本所依据的最近变更")
+    blockers: list[AdmissionBlockerEntry] = Field(
+        default_factory=list, description="片段内全部阻断原因（含槽未发布）"
+    )
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
+class DeliveryAdmissionEntryResult(BaseModel):
+    """准入记录中单条条目的全窗口分段结果（按请求顺序）。"""
+
+    index: int = Field(description="该条目在请求清单中的从 0 起序号")
+    version_id: str | None = Field(description="条目引用的已登记版本（与 slot 二选一）")
+    slot: str | None = Field(description="条目引用的版本槽（与 version_id 二选一）")
+    use: str = Field(description="去首尾空格后的用途")
+    segments: list[DeliveryAdmissionSegment] = Field(
+        description="覆盖整个窗口的连续、无重叠片段；仅在解析版本或判定依据变化时分段"
+    )
+
+
+class DeliveryAdmissionRecord(BaseModel):
+    """已固化的不可变交付准入记录（仅全部条目始终允许才存在）。"""
+
+    delivery_id: str = Field(description="唯一交付号")
+    start: datetime = Field(description="换算为 UTC 后的窗口起点（含）")
+    end: datetime = Field(description="换算为 UTC 后的窗口终点（不含）")
+    created_at: datetime = Field(description="准入记录固化时间（服务按 UTC 生成）")
+    entry_count: int = Field(ge=1, description="交付条目数")
+    entries: list[DeliveryAdmissionEntryResult] = Field(
+        description="按请求顺序冻结的各条目分段（解析版本与判定依据）"
+    )
+
+
+class DeliveryFailureWindow(BaseModel):
+    """某未通过条目的首个失败时段与阻断原因。"""
+
+    start: datetime = Field(description="失败时段起点（含）")
+    end: datetime = Field(description="失败时段终点（不含）")
+    version_id: str | None = Field(
+        description="该时段解析出的目标版本；槽尚未发布时为 null"
+    )
+    release_id: str | None = Field(default=None, description="槽条目：该时段命中的发布标识")
+    revision: int | None = Field(default=None, description="槽条目：该时段命中的发布修订号")
+    blockers: list[AdmissionBlockerEntry] = Field(
+        default_factory=list, description="该时段的全部阻断原因（含槽未发布）"
+    )
+
+
+class DeliveryEntryFailure(BaseModel):
+    """单条未通过条目：首个失败时段及其阻断原因。"""
+
+    index: int = Field(description="该条目在请求清单中的从 0 起序号")
+    version_id: str | None = Field(description="条目引用的已登记版本（与 slot 二选一）")
+    slot: str | None = Field(description="条目引用的版本槽（与 version_id 二选一）")
+    use: str = Field(description="去首尾空格后的用途")
+    first_failure: DeliveryFailureWindow = Field(description="该条目的首个失败时段与阻断原因")
+
+
+class DeliveryAdmissionResponse(BaseModel):
+    """交付准入判定响应：准入时携带冻结记录，未准入时携带逐条失败信息。"""
+
+    replayed: bool = Field(
+        description="同交付号与规范化后相同的有序输入重试时为 true，返回首次冻结记录"
+    )
+    admitted: bool = Field(description="全部条目在整个窗口内始终允许时为 true")
+    delivery_id: str
+    start: datetime = Field(description="换算为 UTC 后的窗口起点（含）")
+    end: datetime = Field(description="换算为 UTC 后的窗口终点（不含）")
+    admission: DeliveryAdmissionRecord | None = Field(
+        default=None, description="仅 admitted=true 时存在：已原子固化的不可变准入记录"
+    )
+    failures: list[DeliveryEntryFailure] = Field(
+        default_factory=list,
+        description="仅 admitted=false 时非空：每条未通过条目的首个失败时段与阻断原因（不留准入记录）",
+    )
 
 
 # -- permission result subscriptions --------------------------------------

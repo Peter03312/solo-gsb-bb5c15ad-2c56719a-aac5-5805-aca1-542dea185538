@@ -17,6 +17,10 @@ from .schemas import (
     BlockerEntry,
     ChangeRevocationRequest,
     CreateResponse,
+    DeliveryAdmissionRecord,
+    DeliveryAdmissionRequest,
+    DeliveryAdmissionResponse,
+    DeliveryEntryFailure,
     ErrorDetail,
     ImpactedVersion,
     KeyRotationResponse,
@@ -351,6 +355,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             basis=[BasisEntry(**b) for b in result["basis"]],
             blockers=[BlockerEntry(**b) for b in result["blockers"]],
             allowed_uses_intersection=result["allowed_uses_intersection"],
+        )
+
+    # -- delivery admissions (whole-window manifest clearance) --------------
+
+    @app.post(
+        "/deliveries/admissions",
+        response_model=DeliveryAdmissionResponse,
+        status_code=201,
+        tags=["deliveries"],
+        summary="判定一份交付清单在整个使用窗口内是否持续获准；全部通过才原子固化准入记录",
+        responses={
+            200: {"description": "同交付号同输入重试返回首次冻结记录（replayed=true），或清单未持续获准（admitted=false，含逐条首个失败时段与阻断原因，不留记录）"},
+            201: {"description": "全部条目在整个窗口内始终允许：准入记录已原子固化"},
+            404: {"description": "条目中存在未登记的版本，整单不落库"},
+            409: {"description": "交付号复用到不同输入"},
+            422: {"description": "起止时刻无时区、窗口为空/倒置、条目为空或用途空白、条目未唯一引用版本或槽"},
+        },
+    )
+    def submit_delivery_admission(
+        payload: DeliveryAdmissionRequest, request: Request
+    ) -> JSONResponse | DeliveryAdmissionResponse:
+        result, replayed = service_from(request).submit_delivery_admission(
+            delivery_id=payload.delivery_id,
+            start=payload.start,
+            end=payload.end,
+            entries=[item.model_dump() for item in payload.entries],
+        )
+        body = DeliveryAdmissionResponse(
+            replayed=replayed,
+            admitted=result["admitted"],
+            delivery_id=result["delivery_id"],
+            start=result["start"],
+            end=result["end"],
+            admission=DeliveryAdmissionRecord(**result["record"])
+            if result["record"] is not None
+            else None,
+            failures=[DeliveryEntryFailure(**f) for f in result["failures"]],
+        )
+        if replayed or not result["admitted"]:
+            # 200 OK distinguishes an idempotent retry from the first freeze,
+            # and a rejected manifest is a valid (non-error) outcome that
+            # leaves no admission record behind.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/deliveries/admissions/{delivery_id}",
+        response_model=DeliveryAdmissionRecord,
+        tags=["deliveries"],
+        summary="按交付号追溯首次固化的准入记录（历史不可改写）",
+        responses={404: {"description": "交付准入记录不存在（或该交付未获准入，未留记录）"}},
+    )
+    def get_delivery_admission(delivery_id: str, request: Request) -> DeliveryAdmissionRecord:
+        return DeliveryAdmissionRecord(
+            **service_from(request).get_delivery_admission(delivery_id)
         )
 
     # -- license changes --------------------------------------------------

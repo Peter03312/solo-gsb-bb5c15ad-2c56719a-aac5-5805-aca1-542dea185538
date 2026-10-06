@@ -192,6 +192,25 @@ SCHEMA_STATEMENTS = [
         updated_at   TEXT NOT NULL
     )
     """,
+    # A delivery admission freezes the proof that an ordered manifest (each
+    # entry naming a registered version OR a version slot plus a use) stayed
+    # permitted for the ENTIRE half-open window [start, end). Only fully
+    # admitted deliveries are stored — a rejected evaluation leaves no row at
+    # all. The normalised inputs (UTC window, ordered entries with trimmed
+    # uses/slot names) feed content_hash for idempotent replay/conflict, and
+    # result_json freezes every entry's segments (resolved version per slice,
+    # basis, blockers, intersection) verbatim, so later catalog changes can
+    # never rewrite a stored admission. Rows are immutable history.
+    """
+    CREATE TABLE IF NOT EXISTS delivery_admissions (
+        delivery_id  TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        start_value  TEXT NOT NULL,
+        end_value    TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        result_json  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -781,3 +800,27 @@ class Database:
             (slot_name,),
         ).fetchone()
         return row is not None
+
+    # -- delivery admissions ------------------------------------------------
+
+    def get_delivery_admission(self, delivery_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM delivery_admissions WHERE delivery_id = ?",
+            (delivery_id,),
+        )
+
+    def insert_delivery_admission(
+        self,
+        delivery_id: str,
+        content_hash: str,
+        start_value: str,
+        end_value: str,
+        created_at: str,
+        result_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO delivery_admissions "
+            "(delivery_id, content_hash, start_value, end_value, created_at, result_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (delivery_id, content_hash, start_value, end_value, created_at, result_json),
+        )
